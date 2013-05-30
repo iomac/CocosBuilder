@@ -32,6 +32,7 @@
 #import "ResolutionSetting.h"
 #import "ProjectSettings.h"
 #import "CCBFileUtil.h"
+#import <CoreGraphics/CGImage.h>
 
 #pragma mark RMSpriteFrame
 
@@ -464,6 +465,10 @@
     {
         return kCCBResTypeJS;
     }
+    else if ([ext isEqualToString:@"json"])
+    {
+        return kCCBResTypeJSON;
+    }
     else if ([ext isEqualToString:@"wav"]
              || [ext isEqualToString:@"mp3"]
              || [ext isEqualToString:@"m4a"]
@@ -684,6 +689,7 @@
                 || res.type == kCCBResTypeCCBFile
                 || res.type == kCCBResTypeDirectory
                 || res.type == kCCBResTypeJS
+                || res.type == kCCBResTypeJSON
                 || res.type == kCCBResTypeAudio)
             {
                 [dir.any addObject:res];
@@ -814,10 +820,7 @@
 
 - (void) createCachedImageFromAuto:(NSString*)autoFile saveAs:(NSString*)dstFile forResolution:(NSString*)res
 {
-    NSData* srcImageData = [NSData dataWithContentsOfFile:autoFile];
-    NSImage* srcImage = [[NSImage alloc] initWithData:srcImageData];
-    NSBitmapImageRep* srcImageRep = [[srcImage representations] objectAtIndex:0];
-    
+    // Calculate the scale factor
     float dstScale = 1;
     if ([res isEqualToString:@"iphone"]) dstScale = 1;
     if ([res isEqualToString:@"iphonehd"]) dstScale = 2;
@@ -837,29 +840,76 @@
     
     float scaleFactor = dstScale/srcScale;
     
-    NSSize oldSizePixels = NSMakeSize([srcImageRep pixelsWide],[srcImageRep pixelsHigh]);
-    NSSize oldSize = [srcImage size];
+    // Load src image
+    CGDataProviderRef dataProvider = CGDataProviderCreateWithFilename([autoFile UTF8String]);
     
+    CGImageRef imageSrc;
+    BOOL isPng = [[autoFile lowercaseString] hasSuffix:@"png"];
+    //If it'a png file, use png dataprovider, or use jpg dataprovider
+    if (isPng) {
+        imageSrc= CGImageCreateWithPNGDataProvider(dataProvider, NULL, NO, kCGRenderingIntentDefault);
+    }else{
+        imageSrc = CGImageCreateWithJPEGDataProvider(dataProvider, NULL, NO, kCGRenderingIntentDefault);
+    }
     
-    NSSize newSize;
-    newSize.width = roundf(oldSizePixels.width*scaleFactor);
-    newSize.height = roundf(oldSizePixels.height*scaleFactor);
+    int wSrc = CGImageGetWidth(imageSrc);
+    int hSrc = CGImageGetHeight(imageSrc);
     
-    NSImage *resizedImage = [[NSImage alloc] initWithSize: newSize];
+    int wDst = wSrc * scaleFactor;
+    int hDst = hSrc * scaleFactor;
     
-    [resizedImage lockFocus];
-    [srcImage drawInRect: NSMakeRect(0, 0, newSize.width, newSize.height) fromRect: NSMakeRect(0, 0, oldSize.width, oldSize.height) operation: NSCompositeSourceOver fraction: 1.0];
-    [resizedImage unlockFocus];
+    BOOL save8BitPNG = NO;
     
-    NSData *tiffData = [resizedImage TIFFRepresentation];
-    NSBitmapImageRep *rep = [NSBitmapImageRep imageRepWithData:tiffData];
-    NSData* dstImageData = [rep representationUsingType: NSPNGFileType
-                                             properties: nil];
+    CGColorSpaceRef colorSpace = CGImageGetColorSpace(imageSrc);
+    if (CGColorSpaceGetModel(colorSpace) == kCGColorSpaceModelIndexed)
+    {
+        colorSpace = CGColorSpaceCreateDeviceRGB();
+        save8BitPNG = YES;
+    }
     
-    // Create directory and write file
+    // Create new, scaled image
+    CGContextRef newContext = CGBitmapContextCreate(NULL, wDst, hDst, 8, wDst*32, colorSpace, kCGImageAlphaPremultipliedLast);
+    
+    // Enable anti-aliasing
+    CGContextSetInterpolationQuality(newContext, kCGInterpolationHigh);
+    CGContextSetShouldAntialias(newContext, TRUE);
+    
+    CGContextDrawImage(newContext, CGContextGetClipBoundingBox(newContext), imageSrc);
+    
+    CGImageRef imageDst = CGBitmapContextCreateImage(newContext);
+    
+    // Create destination directory
     [[NSFileManager defaultManager] createDirectoryAtPath:[dstFile stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:NULL error:NULL];
     
-    [dstImageData writeToFile:dstFile atomically:YES];
+    // Save the image
+    CFURLRef url = (CFURLRef)[NSURL fileURLWithPath:dstFile];
+    CGImageDestinationRef destination = CGImageDestinationCreateWithURL(url, isPng ? kUTTypePNG : kUTTypeJPEG, 1, NULL);
+    CGImageDestinationAddImage(destination, imageDst, nil);
+    
+    if (!CGImageDestinationFinalize(destination)) {
+        NSLog(@"Failed to write image to %@", dstFile);
+    }
+    
+    // Release created objects
+    CFRelease(destination);
+    CGImageRelease(imageSrc);
+    CFRelease(dataProvider);
+    CFRelease(newContext);
+    
+    // Convert file to 8 bit if original uses indexed colors
+    if (save8BitPNG)
+    {
+        CFRelease(colorSpace);
+        
+        NSTask* pngTask = [[NSTask alloc] init];
+        [pngTask setLaunchPath:[[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:@"pngquant"]];
+        NSMutableArray* args = [NSMutableArray arrayWithObjects:
+                                @"--force", @"--ext", @".png", dstFile, nil];
+        [pngTask setArguments:args];
+        [pngTask launch];
+        [pngTask waitUntilExit];
+        [pngTask release];
+    }
     
     // Update modification time to match original file
     NSDate* autoFileDate = [CCBFileUtil modificationDateForFile:autoFile];
